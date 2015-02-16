@@ -145,6 +145,7 @@ while pgrep nginx > /dev/null; do sleep 1; done
 while pgrep memcheck > /dev/null; do sleep 1; done
 
 TEST_TMP="$this_dir/tmp"
+SUPPRESSIONS="$this_dir/valgrind.sup"
 rm -r "$TEST_TMP"
 check_simple mkdir -p "$TEST_TMP"
 PROXY_CACHE="$TEST_TMP/proxycache"
@@ -213,32 +214,35 @@ cat $PAGESPEED_CONF_TEMPLATE \
 check_not_simple grep @@ $PAGESPEED_CONF
 
 # start nginx with new config
-if $USE_VALGRIND; then
-  (valgrind -q --leak-check=full --gen-suppressions=all \
-            --show-possibly-lost=no --log-file=$TEST_TMP/valgrind.log \
-            --suppressions="$this_dir/valgrind.sup" \
-      $NGINX_EXECUTABLE -c $PAGESPEED_CONF) & VALGRIND_PID=$!
-  trap "echo 'terminating valgrind!' && kill -s sigterm $VALGRIND_PID" EXIT
-  echo "Wait until nginx is ready to accept connections"
-  while ! curl -I "http://$PRIMARY_HOSTNAME/mod_pagespeed_example/" 2>/dev/null; do
-      sleep 0.1;
-  done
-  echo "Valgrind (pid:$VALGRIND_PID) is logging to $TEST_TMP/valgrind.log"
-else
-  TRACE_FILE="$TEST_TMP/conf_loading_trace"
-  $NGINX_EXECUTABLE -c $PAGESPEED_CONF >& "$TRACE_FILE"
-  if [[ $? -ne 0 ]]; then
-    echo "FAIL"
-    cat $TRACE_FILE
-    if [[ $(grep -c "unknown directive \"proxy_cache_purge\"" $TRACE_FILE) == 1 ]]; then
-      echo "This test requires proxy_cache_purge. One way to do this:"
-      echo "Run git clone https://github.com/FRiCKLE/ngx_cache_purge.git"
-      echo "And compile nginx with the additional ngx_cache_purge module."
+function start_nginx() {
+  if $USE_VALGRIND; then
+    (valgrind -q --leak-check=full --gen-suppressions=all \
+              --show-possibly-lost=no --log-file=$TEST_TMP/valgrind.log \
+              --suppressions="$SUPPRESSIONS" \
+        $NGINX_EXECUTABLE -c $PAGESPEED_CONF) & VALGRIND_PID=$!
+    trap "echo 'terminating valgrind!' && kill -s sigterm $VALGRIND_PID" EXIT
+    echo "Wait until nginx is ready to accept connections"
+    while ! curl -I "http://$PRIMARY_HOSTNAME/mod_pagespeed_example/" 2>/dev/null; do
+        sleep 0.1;
+    done
+    echo "Valgrind (pid:$VALGRIND_PID) is logging to $TEST_TMP/valgrind.log"
+  else
+    TRACE_FILE="$TEST_TMP/conf_loading_trace"
+    $NGINX_EXECUTABLE -c $PAGESPEED_CONF >& "$TRACE_FILE"
+    if [[ $? -ne 0 ]]; then
+      echo "FAIL"
+      cat $TRACE_FILE
+      if [[ $(grep -c "unknown directive \"proxy_cache_purge\"" $TRACE_FILE) == 1 ]]; then
+        echo "This test requires proxy_cache_purge. One way to do this:"
+        echo "Run git clone https://github.com/FRiCKLE/ngx_cache_purge.git"
+        echo "And compile nginx with the additional ngx_cache_purge module."
+      fi
+      rm $TRACE_FILE
+      exit 1
     fi
-    rm $TRACE_FILE
-    exit 1
   fi
-fi
+}
+start_nginx
 
 # Helper methods used by downstream caching tests.
 
@@ -326,6 +330,7 @@ if $USE_VALGRIND; then
 ~IPRO flow uses cache as expected.~
 ~IPRO flow doesn't copy uncacheable resources multiple times.~
 ~inline_unauthorized_resources allows unauthorized css selectors~
+~Quick shutdown is quick and ungraceful.~
 "
 fi
 
@@ -559,8 +564,6 @@ check test $(scrape_stat image_rewrite_total_original_bytes) -ge 10000
 start_test "Reload config"
 
 # Fire up some heavy load if ab is available to test a stressed reload.
-# TODO(oschaaf): make sure we wait for the new worker to get ready to accept 
-# requests.
 fire_ab_load
 
 check wget $EXAMPLE_ROOT/styles/W.rewrite_css_images.css.pagespeed.cf.Hash.css \
@@ -1208,28 +1211,95 @@ check_from "$OUT" fgrep -qi '404'
 MATCHES=$(echo "$OUT" | grep -c "Cache-Control: override") || true
 check [ $MATCHES -eq 1 ]
 
-start_test Shutting down.
+function check_flushing() {
+  local command="$1"
+  local threshold_sec="$2"
+  local expect_chunk_count="$3"
+  local output=""
+  local start=$(date +%s%N)
+  local chunk_count=0
+
+  while true; do
+    start=$(date +%s%N)
+    # read the http chunk size from the stream.
+    # this is also the read that we use to check timings.
+    check_simple read -t $threshold_sec line
+    line=$(echo $line | tr -d '\n' | tr -d '\r')
+
+    if [ $((16#$line)) -eq "0" ] ; then
+      check [ $expect_chunk_count -eq $chunk_count ]
+      return
+    fi
+    let chunk_count=chunk_count+1
+    # read the actual data from the stream, using the amount indicated in
+    # the previous read. this read should be fast.
+    check_simple read -N $((16#$line)) line
+    # Read trailing \r\n - should be fast.
+    check_simple read -N 2 line
+  done < <($command)
+  check 0
+}
+
+start_test Flush html does what it should do.
+echo "Check that FlushHtml on outputs timely chunks"
+URL="http://flush.example.com/slow-flushing-html-response.php"
+check_flushing "curl -N --raw --silent --proxy $SECONDARY_HOSTNAME $URL" \
+  1.1 6
+
+echo "Check that FlushHtml off outputs a single chunk"
+URL="http://noflush.example.com/slow-flushing-html-response.php"
+check_flushing "curl -N --raw --silent --proxy $SECONDARY_HOSTNAME $URL" \
+  5.5 1
+
+function wait_for_server_exit() {
+  if $USE_VALGRIND; then
+      while pgrep memcheck > /dev/null; do sleep 1; done
+      # Clear the previously set trap, we don't need it anymore.
+      trap - EXIT
+      echo "Checking for valgrind complaints."
+      check_not [ -s "$TEST_TMP/valgrind.log" ]
+  else
+      while pgrep nginx > /dev/null; do sleep 1; done
+  fi
+}
+
+start_test Shutting down gracefully.
 
 # Fire up some heavy load if ab is available to test a stressed shutdown
 fire_ab_load
 
-if $USE_VALGRIND; then
-    kill -s quit $VALGRIND_PID
-    while pgrep memcheck > /dev/null; do sleep 1; done
-    # Clear the previously set trap, we don't need it anymore.
-    trap - EXIT
+SLOW_URL="http://flush.example.com/slow-flushing-html-response.php"
+sleep 1
+# Fire a single slow request -- php-cgi will serialize execution, and
+# testing more would take too long. The quit signal should be received
+# while we are busy transforming the html response.
+OUTFILE="$TEST_TMP/curl_out"
+curl -N --silent --proxy $SECONDARY_HOSTNAME $SLOW_URL > "$OUTFILE" &
 
-    start_test No Valgrind complaints.
-    check_not [ -s "$TEST_TMP/valgrind.log" ]
-else
-    check_simple "$NGINX_EXECUTABLE" -s quit -c "$PAGESPEED_CONF"
-    while pgrep nginx > /dev/null; do sleep 1; done
-fi
+check_simple "$NGINX_EXECUTABLE" -s quit -c "$PAGESPEED_CONF"
 
 if [ "$AB_PID" != "0" ]; then
     echo "Kill ab (pid: $AB_PID)"
     killall -s KILL $AB_PID &>/dev/null || true
 fi
+
+wait_for_server_exit
+
+check [ $(grep -c "</body></html>" $OUTFILE) -eq 1 ]
+
+start_test Quick shutdown is quick and ungraceful.
+start_nginx
+curl -N --silent --proxy $SECONDARY_HOSTNAME $SLOW_URL > "$OUTFILE" &
+# We wait 4 seconds, while the script needs about 5 to finish up.
+sleep 4
+check_simple "$NGINX_EXECUTABLE" -s stop -c "$PAGESPEED_CONF"
+wait_for_server_exit
+
+# Check we received some of the data.
+check [ $(grep -c "bar:1" $OUTFILE) -eq 1 ]
+# The shutdown should be quick enough for us to not receive the last
+# chunk of body data containing the closing body/html tags. 
+check [ $(grep -c "</body></html>" $OUTFILE) -eq 0 ]
 
 start_test Logged output looks healthy.
 

@@ -52,7 +52,7 @@ class InPlaceResourceRecorder;
 // NGX_DECLINED immediately unless send_last_buf.
 ngx_int_t string_piece_to_buffer_chain(
     ngx_pool_t* pool, StringPiece sp,
-    ngx_chain_t** link_ptr, bool send_last_buf);
+    ngx_chain_t** link_ptr, bool send_last_buf, bool flush);
 
 StringPiece str_to_string_piece(ngx_str_t s);
 
